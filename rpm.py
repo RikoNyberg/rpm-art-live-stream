@@ -286,6 +286,7 @@ def detect_clusters(
     width: int,
     height: int,
     min_size: int = 50,
+    min_events_per_pixel: Optional[int] = None,
 ) -> Tuple[np.ndarray, List[Tuple[int, int, int, int]], np.ndarray]:
     """Detect connected clusters of events and compute bounding boxes.
 
@@ -300,6 +301,12 @@ def detect_clusters(
     min_size : int, optional
         Minimum number of pixels in a cluster.  Clusters with fewer
         than this many activated pixels are discarded as noise.
+    min_events_per_pixel : int, optional
+        Minimum number of events that must hit the same pixel within
+        the current window for those events to be considered.  Pixels
+        with fewer hits are treated as background.  Defaults to
+        ``max(1, min_size // 10)`` which scales the requirement with
+        the requested cluster size.
 
     Returns
     -------
@@ -322,14 +329,37 @@ def detect_clusters(
     will fall back to a naive single‑cluster output that spans all
     events.
     """
-    if x_coords.size == 0:
+    x_all = np.asarray(x_coords, dtype=np.int32).ravel()
+    y_all = np.asarray(y_coords, dtype=np.int32).ravel()
+    num_events = x_all.size
+    if num_events == 0:
         # No events: empty outputs
         return np.zeros(0, dtype=np.int32), [], np.empty(0, dtype=np.int32)
+    if min_events_per_pixel is None:
+        min_events_per_pixel = max(1, min_size // 10)
+    min_events_per_pixel = max(1, int(min_events_per_pixel))
+    dense_mask: Optional[np.ndarray] = None
+    x_work = x_all
+    y_work = y_all
+    if min_events_per_pixel > 1:
+        linear_coords = y_all.astype(np.int64) * int(width) + x_all.astype(np.int64)
+        _, inverse_idx, counts = np.unique(linear_coords, return_inverse=True, return_counts=True)
+        keep = counts[inverse_idx] >= min_events_per_pixel
+        if not np.any(keep):
+            # No sufficiently dense events remain
+            return np.zeros(num_events, dtype=np.int32), [], np.empty(0, dtype=np.int32)
+        if not np.all(keep):
+            dense_mask = keep
+            x_work = x_all[keep]
+            y_work = y_all[keep]
+    # After density filtering there may be fewer points
+    if x_work.size == 0:
+        return np.zeros(num_events, dtype=np.int32), [], np.empty(0, dtype=np.int32)
     # Crop to the region containing all events to reduce the occupancy map
-    x_min = int(np.min(x_coords))
-    x_max = int(np.max(x_coords))
-    y_min = int(np.min(y_coords))
-    y_max = int(np.max(y_coords))
+    x_min = int(np.min(x_work))
+    x_max = int(np.max(x_work))
+    y_min = int(np.min(y_work))
+    y_max = int(np.max(y_work))
     # Expand bounding region by 1 pixel on each side to avoid zero area
     x_min = max(0, x_min - 1)
     y_min = max(0, y_min - 1)
@@ -342,7 +372,7 @@ def detect_clusters(
     if _HAS_OPENCV:
         occ = np.zeros((region_h, region_w), dtype=np.uint8)
         # Fill occupancy map
-        occ[y_coords - y_min, x_coords - x_min] = 1
+        occ[y_work - y_min, x_work - x_min] = 1
         # Connected components analysis
         num_labels, labels_map, stats, _ = cv2.connectedComponentsWithStats(occ, connectivity=8)
         # labels_map has shape (region_h, region_w)
@@ -370,15 +400,23 @@ def detect_clusters(
         label_remap = np.zeros(num_labels, dtype=np.int32)
         for idx, cid in enumerate(cluster_ids, start=1):
             label_remap[cid] = idx
-        # Flatten event labels
-        event_labels = label_remap[labels_map[y_coords - y_min, x_coords - x_min]]
-        return event_labels, boxes, np.array(list(range(1, len(cluster_ids) + 1)), dtype=np.int32)
+        # Flatten event labels for the filtered subset
+        filtered_labels = label_remap[labels_map[y_work - y_min, x_work - x_min]]
+        cluster_array = np.array(list(range(1, len(cluster_ids) + 1)), dtype=np.int32)
     else:
         # Fallback when OpenCV is unavailable: single cluster covering all events
         # Compute bounding box
         box = (x_min, y_min, x_max - x_min + 1, y_max - y_min + 1)
-        labels = np.ones_like(x_coords, dtype=np.int32)
-        return labels, [box], np.array([1], dtype=np.int32)
+        boxes = [box]
+        filtered_labels = np.ones_like(x_work, dtype=np.int32)
+        cluster_array = np.array([1], dtype=np.int32)
+    if dense_mask is None:
+        return filtered_labels, boxes, cluster_array
+    # Expand filtered labels back to the original event array, marking
+    # filtered-out events as background (label 0).
+    labels_full = np.zeros(num_events, dtype=np.int32)
+    labels_full[dense_mask] = filtered_labels
+    return labels_full, boxes, cluster_array
 
 
 def analyze_window(
