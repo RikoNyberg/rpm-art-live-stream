@@ -1,0 +1,4 @@
+evio @ git+https://github.com/ahtihelminen/evio.git@33b2eaa1bf56d35740743a3209dac739b86618c9
+numpy==2.2.6
+opencv-python==4.12.0.88
+scipy==1.15.3
