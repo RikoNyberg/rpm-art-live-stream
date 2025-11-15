@@ -24,13 +24,13 @@ repository.  It can be installed as a module by adding the parent
 directory to your ``PYTHONPATH`` or by using a proper packaging tool.
 """
 
-from .rpm import (
+from rpm import (
     decode_window,
     estimate_rpm,
     analyze_window,
     detect_clusters,
 )
-from .visualization import visualize_dat
+from visualization import visualize_dat
 
 __all__ = [
     "decode_window",

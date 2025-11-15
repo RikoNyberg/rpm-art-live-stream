@@ -22,6 +22,7 @@ rendering.
 
 from __future__ import annotations
 
+from statistics import mean
 from typing import Iterable, Tuple, List, Dict
 
 import time
@@ -29,12 +30,8 @@ import itertools
 
 import numpy as np
 
-try:
-    import cv2  # type: ignore
+import cv2
 
-    _HAS_CV2 = True
-except Exception:
-    _HAS_CV2 = False
 
 from evio.core.pacer import Pacer
 from evio.core.recording import open_dat
@@ -42,6 +39,7 @@ from evio.source.dat_file import DatFileSource
 
 from rpm import decode_window, analyze_window
 
+BLADE_COUNT = 2
 
 def _get_frame(
     x_coords: np.ndarray,
@@ -82,7 +80,6 @@ def _draw_overlay(
     frame: np.ndarray,
     pacer: Pacer,
     batch_range: object,
-    global_rpm: float,
     clusters: List[Dict[str, object]],
     *,
     hud_color: Tuple[int, int, int] = (0, 0, 0),
@@ -130,7 +127,7 @@ def _draw_overlay(
             first_row = (
                 f"(target) speed={pacer.speed:.2f}x  force_speed=False, no drops"
             )
-        second_row = f"wall={wall_time_s:7.3f}s  rec={rec_time_s:7.3f}s  global RPM={global_rpm:7.1f}"
+        second_row = f"wall={wall_time_s:7.3f}s  rec={rec_time_s:7.3f}s  Mean RPM={mean([c['rpm']/BLADE_COUNT for c in clusters]):7.1f}"
         cv2.putText(
             frame,
             first_row,
@@ -182,7 +179,6 @@ def visualize_dat(
     rpm_range: Tuple[int, int] = (1000, 7000),
     speed: float = 1.0,
     force_speed: bool = False,
-    rpm_method: str = "periodogram",
     min_cluster_size: int = 50,
     display: bool = True,
     **rpm_kwargs: object,
@@ -208,8 +204,6 @@ def visualize_dat(
     force_speed : bool, optional
         Whether to drop windows to maintain the target playback speed.
         See ``evio.core.pacer.Pacer`` for details.
-    rpm_method : {'periodogram', 'median'}, optional
-        Method used for RPM estimation.  See ``estimate_rpm``.
     min_cluster_size : int, optional
         Minimum cluster size for drone detection.  Clusters smaller
         than this many occupied pixels are ignored.
@@ -231,10 +225,6 @@ def visualize_dat(
     across multiple frames outside of this function and passing them
     into ``analyze_window`` separately.
     """
-    if not _HAS_CV2 and display:
-        raise RuntimeError(
-            "OpenCV is not available; cannot display frames. Set display=False to run headlessly."
-        )
     # Convert milliseconds to microseconds
     window_us = int(window_ms * 1000)
     # Load the recording once to get timestamps, width and height
@@ -261,7 +251,7 @@ def visualize_dat(
         # rec.timestamps is sorted; slice with batch indices since ranges are in sorted order
         ts_us = rec.timestamps[batch_range.start : batch_range.stop]
         # Compute analytics: global RPM and per‑cluster bounding boxes & RPM
-        global_rpm, clusters = analyze_window(
+        clusters = analyze_window(
             x_coords,
             y_coords,
             ts_us,
@@ -269,14 +259,13 @@ def visualize_dat(
             height,
             rpm_range=rpm_range,
             min_cluster_size=min_cluster_size,
-            rpm_method=rpm_method,
             **rpm_kwargs,
         )
         if display:
             # Build frame
             frame = _get_frame(x_coords, y_coords, polarities, width, height)
             # Draw overlay text and boxes
-            _draw_overlay(frame, pacer, batch_range, global_rpm, clusters)
+            _draw_overlay(frame, pacer, batch_range, clusters)
             # Show frame
             cv2.imshow("Event Viewer", frame)
             # Poll key; break on Esc or q

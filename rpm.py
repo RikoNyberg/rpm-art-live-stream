@@ -17,7 +17,7 @@ The core functionality consists of the following:
   polarity arrays.  This replicates the logic in ``play_dat.py`` but is
   exposed as a reusable function.
 
-* ``estimate_rpm(timestamps_us, rpm_range=(1000, 7000), method='periodogram')`` –
+* ``estimate_rpm(timestamps_us, rpm_range=(1000, 7000))`` –
   Estimates the rotational speed in RPM given an array of event
   timestamps (microseconds).  Two methods are provided: a fast
   median‑based estimator and a more robust periodogram (FFT) based
@@ -47,25 +47,16 @@ select the estimator via the ``method`` argument.
 
 from __future__ import annotations
 
-from typing import Iterable, List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 
-try:
-    # SciPy’s periodogram gives a more robust spectral estimate.
-    from scipy.signal import periodogram
+# SciPy’s periodogram gives a more robust spectral estimate.
+from scipy.signal import periodogram
+import cv2  # type: ignore
 
-    _HAS_SCIPY = True
-except Exception:
-    _HAS_SCIPY = False
 
-try:
-    import cv2  # type: ignore
-
-    _HAS_OPENCV = True
-except Exception:
-    _HAS_OPENCV = False
-
+MIN_EVENTS_PER_PIXEL = 10
 
 def decode_window(
     event_words: np.ndarray,
@@ -191,8 +182,6 @@ def _periodogram_rpm(
         Estimated RPM or ``NaN`` if SciPy is unavailable or the input
         lacks sufficient events.
     """
-    if not _HAS_SCIPY or timestamps_us.size < minimum_events:
-        return _median_rpm(timestamps_us, rpm_range)
     t0 = float(timestamps_us[0])
     duration_us = float(timestamps_us[-1] - t0)
     if duration_us <= 0:
@@ -232,7 +221,6 @@ def _periodogram_rpm(
 def estimate_rpm(
     timestamps_us: np.ndarray,
     rpm_range: Tuple[int, int] = (1000, 7000),
-    method: str = "periodogram",
     **kwargs: object,
 ) -> float:
     """Estimate the rotational speed (RPM) from event timestamps.
@@ -273,11 +261,7 @@ def estimate_rpm(
     # Guarantee monotonic order
     if not (np.all(np.diff(ts) >= 0)):
         ts = np.sort(ts)
-    method = method.lower()
-    if method == "periodogram" and _HAS_SCIPY:
-        return _periodogram_rpm(ts, rpm_range, **kwargs)
-    # Fallback to median estimator
-    return _median_rpm(ts, rpm_range)
+    return _periodogram_rpm(ts, rpm_range, **kwargs)
 
 
 def detect_clusters(
@@ -369,47 +353,41 @@ def detect_clusters(
     region_h = y_max - y_min + 1
     # Allocate occupancy image
     # Use uint8 to save memory; 1 means event present
-    if _HAS_OPENCV:
-        occ = np.zeros((region_h, region_w), dtype=np.uint8)
-        # Fill occupancy map
-        occ[y_work - y_min, x_work - x_min] = 1
-        # Connected components analysis
-        num_labels, labels_map, stats, _ = cv2.connectedComponentsWithStats(occ, connectivity=8)
-        # labels_map has shape (region_h, region_w)
-        # Extract bounding boxes for clusters above min_size
-        boxes: List[Tuple[int, int, int, int]] = []
-        cluster_ids: List[int] = []
-        # labels 0 is background; start from 1
-        for label_id in range(1, num_labels):
-            count = int(stats[label_id, cv2.CC_STAT_AREA])  # type: ignore
-            if count < min_size:
-                continue
-            x = int(stats[label_id, cv2.CC_STAT_LEFT])  # type: ignore
-            y = int(stats[label_id, cv2.CC_STAT_TOP])  # type: ignore
-            w = int(stats[label_id, cv2.CC_STAT_WIDTH])  # type: ignore
-            h = int(stats[label_id, cv2.CC_STAT_HEIGHT])  # type: ignore
-            # Convert region coordinates back to full frame coordinates
-            boxes.append((x + x_min, y + y_min, w, h))
-            cluster_ids.append(label_id)
-        if not boxes:
-            # If no cluster passes threshold, produce one covering all events
-            boxes = [(x_min, y_min, region_w, region_h)]
-            cluster_ids = [1]
-        # Map per‑event labels; collapse small clusters to background (0)
-        # Build mapping from region label id to cluster index (1..)
-        label_remap = np.zeros(num_labels, dtype=np.int32)
-        for idx, cid in enumerate(cluster_ids, start=1):
-            label_remap[cid] = idx
-        # Flatten event labels for the filtered subset
-        filtered_labels = label_remap[labels_map[y_work - y_min, x_work - x_min]]
-        cluster_array = np.array(list(range(1, len(cluster_ids) + 1)), dtype=np.int32)
-    else:
-        # Fallback when OpenCV is unavailable: single cluster covering all events
-        # Compute bounding box
-        box = (x_min, y_min, x_max - x_min + 1, y_max - y_min + 1)
-        boxes = [box]
-        filtered_labels = np.ones_like(x_work, dtype=np.int32)
-        cluster_array = np.array([1], dtype=np.int32)
+    
+    occ = np.zeros((region_h, region_w), dtype=np.uint8)
+    # Fill occupancy map
+    occ[y_work - y_min, x_work - x_min] = 1
+    # Connected components analysis
+    num_labels, labels_map, stats, _ = cv2.connectedComponentsWithStats(occ, connectivity=8)
+    # labels_map has shape (region_h, region_w)
+    # Extract bounding boxes for clusters above min_size
+    boxes: List[Tuple[int, int, int, int]] = []
+    cluster_ids: List[int] = []
+    # labels 0 is background; start from 1
+    for label_id in range(1, num_labels):
+        count = int(stats[label_id, cv2.CC_STAT_AREA])  # type: ignore
+        if count < min_size:
+            continue
+        x = int(stats[label_id, cv2.CC_STAT_LEFT])  # type: ignore
+        y = int(stats[label_id, cv2.CC_STAT_TOP])  # type: ignore
+        w = int(stats[label_id, cv2.CC_STAT_WIDTH])  # type: ignore
+        h = int(stats[label_id, cv2.CC_STAT_HEIGHT])  # type: ignore
+        # Convert region coordinates back to full frame coordinates
+        boxes.append((x + x_min, y + y_min, w, h))
+        cluster_ids.append(label_id)
+    if not boxes:
+        # If no cluster passes threshold, produce one covering all events
+        boxes = [(x_min, y_min, region_w, region_h)]
+        cluster_ids = [1]
+    # Map per‑event labels; collapse small clusters to background (0)
+    # Build mapping from region label id to cluster index (1..)
+    label_remap = np.zeros(num_labels, dtype=np.int32)
+    for idx, cid in enumerate(cluster_ids, start=1):
+        label_remap[cid] = idx
+    # Flatten event labels for the filtered subset
+    filtered_labels = label_remap[labels_map[y_work - y_min, x_work - x_min]]
+    cluster_array = np.array(list(range(1, len(cluster_ids) + 1)), dtype=np.int32)
+
     if dense_mask is None:
         return filtered_labels, boxes, cluster_array
     # Expand filtered labels back to the original event array, marking
@@ -427,9 +405,8 @@ def analyze_window(
     height: int,
     rpm_range: Tuple[int, int] = (1000, 7000),
     min_cluster_size: int = 50,
-    rpm_method: str = "periodogram",
     **rpm_kwargs: object,
-) -> Tuple[float, List[Dict[str, object]]]:
+) -> List[Dict[str, object]]:
     """Compute global and per‑cluster RPM estimates and bounding boxes.
 
     Given decoded event data for a single time window, this function
@@ -455,9 +432,6 @@ def analyze_window(
         speeds.
     min_cluster_size : int, optional
         Minimum number of pixels for a cluster to be retained.
-    rpm_method : {'periodogram', 'median'}, optional
-        Which estimation method to use when computing RPM.  See
-        ``estimate_rpm``.
     **rpm_kwargs :
         Additional parameters forwarded to ``estimate_rpm``.
 
@@ -481,10 +455,8 @@ def analyze_window(
         ts = ts[order]
         x = x[order]
         y = y[order]
-    # Global RPM over the entire window
-    global_rpm = estimate_rpm(ts, rpm_range=rpm_range, method=rpm_method, **rpm_kwargs)
     # Detect clusters and bounding boxes
-    labels, boxes, cluster_ids = detect_clusters(x, y, width, height, min_size=min_cluster_size)
+    labels, boxes, cluster_ids = detect_clusters(x, y, width, height, min_size=min_cluster_size) #, min_events_per_pixel=MIN_EVENTS_PER_PIXEL)
     clusters: List[Dict[str, object]] = []
     for idx, box in enumerate(boxes, start=1):
         # Extract indices belonging to this cluster
@@ -493,6 +465,6 @@ def analyze_window(
         if cluster_ts.size == 0:
             rpm = float("nan")
         else:
-            rpm = estimate_rpm(cluster_ts, rpm_range=rpm_range, method=rpm_method, **rpm_kwargs)
+            rpm = estimate_rpm(cluster_ts, rpm_range=rpm_range, **rpm_kwargs)
         clusters.append({"box": box, "rpm": rpm})
-    return global_rpm, clusters
+    return clusters
