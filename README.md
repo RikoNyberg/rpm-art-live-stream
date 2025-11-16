@@ -1,4 +1,4 @@
-# Senso Radar
+# RPM-ART: Live Stream Radar
 
 A lightweight toolkit for replaying `.dat` recordings from a Prophesee
 event camera, clustering rotor blade events, and estimating the RPM of
