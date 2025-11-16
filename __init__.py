@@ -31,9 +31,10 @@ from rpm import (
     analyze_window,
     detect_clusters,
 )
-from visualization import visualize_dat
+from visualization import EventWindow, visualize_dat
 
 __all__ = [
+    "EventWindow",
     "ClusterResult",
     "decode_window",
     "estimate_rpm",

@@ -9,9 +9,11 @@ example but extends it with analytics from ``event_tools.rpm``.
 Example usage::
 
     from event_tools.visualization import visualize_dat
+    from event_tools.main import stream_dat_file  # helper producing EventWindow objects
 
-    # Play a recording with 100 ms display windows and RPM estimates
-    visualize_dat("path/to/file.dat", window_ms=100, rpm_range=(1000, 7000))
+    # Play a recording with 100 ms display windows and RPM estimates
+    stream = stream_dat_file("path/to/file.dat", window_ms=100)
+    visualize_dat(stream, rpm_range=(1000, 7000))
 
 The display can be interrupted by pressing ``Esc`` or ``q``.  When
 running in a headless environment the function can be invoked with
@@ -22,24 +24,35 @@ rendering.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import itertools
 import time
 from statistics import mean
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 
 import cv2
 
-
-from evio.core.pacer import Pacer
-from evio.core.recording import open_dat
-from evio.source.dat_file import DatFileSource
-
-from rpm import ClusterResult, analyze_window, decode_window
+from rpm import ClusterResult, analyze_window
 
 
 WINDOW_NAME = "Event Viewer"
+
+
+@dataclass(frozen=True)
+class EventWindow:
+    """Represents a single slice of streamed event data."""
+
+    x_coords: np.ndarray
+    y_coords: np.ndarray
+    polarities: np.ndarray
+    timestamps_us: np.ndarray
+    width: int
+    height: int
+    start_ts_us: int
+    end_ts_us: int
+    metadata: Optional[object] = None
 
 
 def _get_frame(
@@ -79,8 +92,7 @@ def _get_frame(
 
 def _draw_overlay(
     frame: np.ndarray,
-    pacer: Pacer,
-    batch_range: object,
+    hud_lines: Sequence[str],
     clusters: Sequence[ClusterResult],
     blade_count: int,
     *,
@@ -100,12 +112,8 @@ def _draw_overlay(
     ----------
     frame : np.ndarray
         The frame onto which annotations are drawn (modified in place).
-    pacer : Pacer
-        Pacer instance used for playback timing; used to compute wall
-        time and recording time.
-    batch_range : BatchRange
-        Represents the current window range; used to compute the
-        recording time offset displayed in the HUD.
+    hud_lines : Sequence[str]
+        Lines of text rendered at the top-left corner acting as the HUD.
     clusters : Sequence[ClusterResult]
         Per-cluster results defining bounding boxes and RPM values.
     hud_color : tuple, optional
@@ -118,28 +126,10 @@ def _draw_overlay(
         Vertical pixel offset for cluster labels relative to the top
         of the bounding box.
     """
-    # Draw HUD similar to play_dat.py
-    if pacer._t_start is not None and pacer._e_start is not None:
-        wall_time_s = time.perf_counter() - pacer._t_start
-        rec_time_s = max(0.0, (batch_range.end_ts_us - pacer._e_start) / 1e6)
-        if pacer.force_speed:
-            first_row = (
-                f"speed={pacer.speed:.2f}x  drops/ms={pacer.instantaneous_drop_rate:.2f}  "
-                f"avg(drops/ms)={pacer.average_drop_rate:.2f}"
-            )
-        else:
-            first_row = (
-                f"(target) speed={pacer.speed:.2f}x  force_speed=False, no drops"
-            )
-        rpm_values = [
-            cluster.rpm / blade_count
-            for cluster in clusters
-            if not np.isnan(cluster.rpm)
-        ]
-        mean_rpm = mean(rpm_values) if rpm_values else float("nan")
-        second_row = f"wall={wall_time_s:7.3f}s  rec={rec_time_s:7.3f}s  Mean RPM={mean_rpm:7.1f}"
-        cv2.putText(frame, first_row, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, second_row, (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1, cv2.LINE_AA)
+    # HUD text lines
+    for idx, line in enumerate(hud_lines):
+        y = 20 + idx * 20
+        cv2.putText(frame, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1, cv2.LINE_AA)
     # Cycle through provided colors for clusters
     color_cycle = itertools.cycle(box_colors)
     for cluster, color in zip(clusters, color_cycle):
@@ -152,13 +142,10 @@ def _draw_overlay(
 
 
 def visualize_dat(
-    dat_path: str,
+    windows: Iterable[EventWindow],
     blade_count: int = 2,
     *,
-    window_ms: float = 10.0,
     rpm_range: Tuple[int, int] = (1000, 7000),
-    speed: float = 1.0,
-    force_speed: bool = False,
     min_cluster_size: int = 50,
     min_fill_ratio: float = 0.15,
     max_aspect_ratio: Optional[float] = None,
@@ -166,30 +153,22 @@ def visualize_dat(
     display: bool = True,
     **rpm_kwargs: object,
 ) -> None:
-    """Stream a ``.dat`` file with RPM and bounding box overlays.
+    """Render streamed event windows with RPM and bounding box overlays.
 
     Parameters
     ----------
-    dat_path : str
-        Path to the ``.dat`` recording to play.
+    windows : Iterable[EventWindow]
+        Stream of pre-decoded event windows.  Each window provides
+        coordinates, polarities, timestamps and the frame resolution.
+        The iterable can be backed by a live stream or by an offline
+        ``.dat`` file reader.
     blade_count : int, optional
         Number of blades or repeating features per revolution.  Used to
         convert event RPM values to mechanical RPM.  Must be positive.
-    window_ms : float, optional
-        Length of the display window in milliseconds.  This controls
-        how many events are grouped into each frame and implicitly
-        determines the time period used for RPM estimation.  Larger
-        values produce smoother RPM estimates at the cost of latency.
     rpm_range : tuple, optional
         Allowed range of RPM values.  The estimator will clip to this
         interval.  Defaults to (1000, 7000) which spans typical
         rotating fan and drone propeller speeds.
-    speed : float, optional
-        Playback speed multiplier.  ``1.0`` renders in real time; larger
-        values accelerate playback.
-    force_speed : bool, optional
-        Whether to drop windows to maintain the target playback speed.
-        See ``evio.core.pacer.Pacer`` for details.
     min_cluster_size : int, optional
         Minimum cluster size for drone detection.  Clusters smaller
         than this many occupied pixels are ignored.
@@ -211,54 +190,30 @@ def visualize_dat(
     **rpm_kwargs :
         Extra parameters forwarded to the RPM estimator.  See
         ``estimate_rpm`` and ``analyze_window``.
-
-    Notes
-    -----
-    The underlying ``DatFileSource`` always constructs windows of
-    ``window_ms`` duration.  If smoother RPM estimates are desired
-    without increasing display latency, consider accumulating events
-    across multiple frames outside of this function and passing them
-    into ``analyze_window`` separately.
     """
     if blade_count <= 0:
         raise ValueError("blade_count must be positive")
-    if window_ms <= 0:
-        raise ValueError("window_ms must be positive")
-    # Convert milliseconds to microseconds
-    window_us = int(window_ms * 1000)
-    # Load the recording once to get timestamps, width and height
-    rec = open_dat(dat_path, width=1280, height=720)  # default resolution
-    width = int(rec.width)
-    height = int(rec.height)
-    # Use DatFileSource to precompute window ranges and event_words/order
-    src = DatFileSource(dat_path, window_length_us=window_us, width=width, height=height)
-    # Use Pacer to enforce playback speed
-    pacer = Pacer(speed=speed, force_speed=force_speed)
-    
-    # Setup display window you want to view the calculations
+
+    window_iter = iter(windows)
+    try:
+        first_window = next(window_iter)
+    except StopIteration:
+        return
+
+    chain_iter: Iterator[EventWindow] = itertools.chain([first_window], window_iter)
+    rec_start_ts = first_window.start_ts_us
+    wall_start = time.perf_counter()
+
     if display:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    
-    # Iterate over windows
-    for batch_range in pacer.pace(src.ranges()):
-        # Decode events and polarities for this window
-        x_coords, y_coords, polarities = decode_window(
-            src.event_words,
-            src.order,
-            batch_range.start,
-            batch_range.stop,
-        )
-        
-        # Retrieve sorted timestamps for the same slice
-        # rec.timestamps is sorted; slice with batch indices since ranges are in sorted order
-        ts_us = rec.timestamps[batch_range.start : batch_range.stop]
-        # Compute analytics: global RPM and per‑cluster bounding boxes & RPM
+
+    for idx, window in enumerate(chain_iter):
         clusters = analyze_window(
-            x_coords,
-            y_coords,
-            ts_us,
-            width,
-            height,
+            window.x_coords,
+            window.y_coords,
+            window.timestamps_us,
+            window.width,
+            window.height,
             rpm_range=rpm_range,
             min_cluster_size=min_cluster_size,
             min_fill_ratio=min_fill_ratio,
@@ -266,19 +221,28 @@ def visualize_dat(
             min_events_per_pixel=min_events_per_pixel,
             **rpm_kwargs,
         )
-        
-        if display:
-            # Build frame
-            frame = _get_frame(x_coords, y_coords, polarities, width, height)
-            # Draw overlay text and boxes
-            _draw_overlay(frame, pacer, batch_range, clusters, blade_count)
-            # Show frame
-            cv2.imshow(WINDOW_NAME, frame)
-            # Poll key; break on Esc or q
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
-                break
-        # If not displaying, still respect potential drop by pacer
-    # Cleanup
+
+        if not display:
+            continue
+
+        frame = _get_frame(window.x_coords, window.y_coords, window.polarities, window.width, window.height)
+        rpm_values = [
+            cluster.rpm / blade_count
+            for cluster in clusters
+            if not np.isnan(cluster.rpm)
+        ]
+        mean_rpm = mean(rpm_values) if rpm_values else float("nan")
+        wall_time_s = time.perf_counter() - wall_start
+        rec_time_s = max(0.0, (window.end_ts_us - rec_start_ts) / 1e6)
+        hud_lines = (
+            f"frames={idx:05d}  wall={wall_time_s:7.3f}s",
+            f"rec={rec_time_s:7.3f}s  Mean RPM={mean_rpm:7.1f}",
+        )
+        _draw_overlay(frame, hud_lines, clusters, blade_count)
+        cv2.imshow(WINDOW_NAME, frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord("q")):
+            break
+
     if display:
         cv2.destroyWindow(WINDOW_NAME)
