@@ -271,6 +271,8 @@ def detect_clusters(
     height: int,
     min_size: int = 50,
     min_events_per_pixel: Optional[int] = None,
+    min_fill_ratio: float = 0.0,
+    max_aspect_ratio: Optional[float] = None,
 ) -> Tuple[np.ndarray, List[Tuple[int, int, int, int]], np.ndarray]:
     """Detect connected clusters of events and compute bounding boxes.
 
@@ -291,6 +293,12 @@ def detect_clusters(
         with fewer hits are treated as background.  Defaults to
         ``max(1, min_size // 10)`` which scales the requirement with
         the requested cluster size.
+    min_fill_ratio : float, optional
+        Minimum fraction of active pixels inside the bounding box for
+        a cluster to be retained.  Helps reject large, sparse blobs.
+    max_aspect_ratio : float, optional
+        Maximum allowed ratio between width and height.  Thin shapes
+        with ratios above this threshold are discarded.
 
     Returns
     -------
@@ -363,6 +371,7 @@ def detect_clusters(
     # Extract bounding boxes for clusters above min_size
     boxes: List[Tuple[int, int, int, int]] = []
     cluster_ids: List[int] = []
+    heuristics_active = min_fill_ratio > 0.0 or (max_aspect_ratio is not None)
     # labels 0 is background; start from 1
     for label_id in range(1, num_labels):
         count = int(stats[label_id, cv2.CC_STAT_AREA])  # type: ignore
@@ -372,10 +381,22 @@ def detect_clusters(
         y = int(stats[label_id, cv2.CC_STAT_TOP])  # type: ignore
         w = int(stats[label_id, cv2.CC_STAT_WIDTH])  # type: ignore
         h = int(stats[label_id, cv2.CC_STAT_HEIGHT])  # type: ignore
+        if w <= 0 or h <= 0:
+            continue
+        if min_fill_ratio > 0.0:
+            box_area = float(w * h)
+            fill_ratio = count / box_area if box_area > 0 else 0.0
+            if fill_ratio < min_fill_ratio:
+                continue
+        if max_aspect_ratio is not None and max_aspect_ratio > 0:
+            short_side = max(1, min(w, h))
+            aspect = max(w, h) / float(short_side)
+            if aspect > max_aspect_ratio:
+                continue
         # Convert region coordinates back to full frame coordinates
         boxes.append((x + x_min, y + y_min, w, h))
         cluster_ids.append(label_id)
-    if not boxes:
+    if not boxes and not heuristics_active:
         # If no cluster passes threshold, produce one covering all events
         boxes = [(x_min, y_min, region_w, region_h)]
         cluster_ids = [1]
@@ -405,6 +426,8 @@ def analyze_window(
     height: int,
     rpm_range: Tuple[int, int] = (1000, 7000),
     min_cluster_size: int = 50,
+    min_fill_ratio: float = 0.0,
+    max_aspect_ratio: Optional[float] = None,
     **rpm_kwargs: object,
 ) -> List[Dict[str, object]]:
     """Compute global and per‑cluster RPM estimates and bounding boxes.
@@ -432,18 +455,21 @@ def analyze_window(
         speeds.
     min_cluster_size : int, optional
         Minimum number of pixels for a cluster to be retained.
+    min_fill_ratio : float, optional
+        Minimum occupancy ratio (active pixels divided by bounding box
+        area).  Clusters with lower ratios are discarded.
+    max_aspect_ratio : float, optional
+        Maximum allowed width/height ratio for clusters.
     **rpm_kwargs :
         Additional parameters forwarded to ``estimate_rpm``.
 
     Returns
     -------
-    global_rpm : float
-        Estimated RPM using all events in the window.
     clusters : list of dicts
         Each dictionary has the keys ``'box'`` (a 4‑tuple of x, y, w, h)
         and ``'rpm'`` (a float).  The list is sorted in ascending
-        order of cluster ID.  If no clusters are detected, the list
-        contains a single entry covering all events.
+        order of cluster ID.  If the heuristics reject all clusters the
+        list may be empty.
     """
     # Ensure arrays are NumPy arrays of correct dtype
     x = np.asarray(x_coords, dtype=np.int32)
@@ -456,7 +482,15 @@ def analyze_window(
         x = x[order]
         y = y[order]
     # Detect clusters and bounding boxes
-    labels, boxes, cluster_ids = detect_clusters(x, y, width, height, min_size=min_cluster_size) #, min_events_per_pixel=MIN_EVENTS_PER_PIXEL)
+    labels, boxes, cluster_ids = detect_clusters(
+        x,
+        y,
+        width,
+        height,
+        min_size=min_cluster_size,
+        min_fill_ratio=min_fill_ratio,
+        max_aspect_ratio=max_aspect_ratio,
+    )  # , min_events_per_pixel=MIN_EVENTS_PER_PIXEL)
     clusters: List[Dict[str, object]] = []
     for idx, box in enumerate(boxes, start=1):
         # Extract indices belonging to this cluster
