@@ -1,5 +1,7 @@
 # RPM-ART: Live Stream Radar
 
+ [![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/etFZYg8TpOo/0.jpg)](https://www.youtube.com/watch?v=etFZYg8TpOo)
+
 A lightweight toolkit for replaying `.dat` recordings from a Prophesee
 event camera, clustering rotor blade events, and estimating the RPM of
 fans or drones in real time. The `main.py` entry point streams a
