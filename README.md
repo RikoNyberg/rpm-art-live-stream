@@ -17,6 +17,20 @@ recording window-by-window, decodes packed events, and feeds them into
    The second command pulls the `evio` utilities used for decoding
    Prophesee `.dat` files.
 
+## Large File Storage (LFS)
+
+The sample recordings in `data/` are tracked with Git LFS. If you do not
+have it installed, follow the official instructions for your platform:
+https://git-lfs.com/. After installation, run:
+
+```bash
+git lfs install
+git lfs pull
+```
+
+`git lfs install` enables LFS hooks for the repository, and `git lfs pull`
+downloads the tracked data blobs into `data/`.
+
 ## Usage
 
 1. Place your `.dat` recordings in the `data/` directory or update the
