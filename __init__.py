@@ -25,6 +25,7 @@ directory to your ``PYTHONPATH`` or by using a proper packaging tool.
 """
 
 from rpm import (
+    ClusterResult,
     decode_window,
     estimate_rpm,
     analyze_window,
@@ -33,6 +34,7 @@ from rpm import (
 from visualization import visualize_dat
 
 __all__ = [
+    "ClusterResult",
     "decode_window",
     "estimate_rpm",
     "analyze_window",

@@ -30,11 +30,10 @@ The core functionality consists of the following:
   threshold prevents spurious detections.
 
 * ``analyze_window(x_coords, y_coords, timestamps_us, width, height, rpm_range=(1000,7000), min_cluster_size=50)`` –
-  Combines cluster detection and frequency estimation.  Returns a
-  global RPM for the entire window and a list of per‑cluster
-  dictionaries containing bounding boxes and RPM estimates.  The
-  bounding box coordinates refer to the original pixel coordinate
-  system (top‑left origin).
+  Combines cluster detection and frequency estimation.  Returns a list
+  of :class:`ClusterResult` objects containing bounding boxes and RPM
+  estimates.  The bounding box coordinates refer to the original pixel
+  coordinate system (top‑left origin).
 
 All functions are annotated for type checking and strive to avoid
 heavy allocations.  For example, the cluster detection first crops
@@ -47,7 +46,8 @@ select the estimator via the ``method`` argument.
 
 from __future__ import annotations
 
-from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
 
 import numpy as np
 
@@ -56,7 +56,12 @@ from scipy.signal import periodogram
 import cv2  # type: ignore
 
 
-MIN_EVENTS_PER_PIXEL = 10
+@dataclass(frozen=True)
+class ClusterResult:
+    """Simple container describing a detected cluster and its RPM."""
+
+    box: Tuple[int, int, int, int]
+    rpm: float
 
 def decode_window(
     event_words: np.ndarray,
@@ -136,8 +141,9 @@ def _median_rpm(timestamps_us: np.ndarray, rpm_range: Tuple[int, int]) -> float:
     diffs = diffs[diffs > 0]
     if diffs.size == 0:
         return float("nan")
-    # Use the lower percentile to reduce influence of spurious long gaps
-    median_diff = float(np.median(np.clip(diffs, np.percentile(diffs, 5), np.percentile(diffs, 95))))
+    # Use trimmed percentiles to reduce influence of spurious long gaps
+    low, high = np.percentile(diffs, [5, 95])
+    median_diff = float(np.median(np.clip(diffs, low, high)))
     # Assume two events per rotation (positive and negative edge)
     period_us = median_diff * 2.0
     if period_us <= 0:
@@ -182,6 +188,8 @@ def _periodogram_rpm(
         Estimated RPM or ``NaN`` if SciPy is unavailable or the input
         lacks sufficient events.
     """
+    if timestamps_us.size < max(2, int(minimum_events)):
+        return _median_rpm(timestamps_us, rpm_range)
     t0 = float(timestamps_us[0])
     duration_us = float(timestamps_us[-1] - t0)
     if duration_us <= 0:
@@ -428,8 +436,9 @@ def analyze_window(
     min_cluster_size: int = 50,
     min_fill_ratio: float = 0.0,
     max_aspect_ratio: Optional[float] = None,
+    min_events_per_pixel: Optional[int] = None,
     **rpm_kwargs: object,
-) -> List[Dict[str, object]]:
+) -> List[ClusterResult]:
     """Compute global and per‑cluster RPM estimates and bounding boxes.
 
     Given decoded event data for a single time window, this function
@@ -462,14 +471,16 @@ def analyze_window(
         Maximum allowed width/height ratio for clusters.
     **rpm_kwargs :
         Additional parameters forwarded to ``estimate_rpm``.
+    min_events_per_pixel : int, optional
+        If provided, requires at least this many hits per pixel before
+        the pixel is considered when forming clusters.  Useful for
+        filtering out sparse noise.
 
     Returns
     -------
-    clusters : list of dicts
-        Each dictionary has the keys ``'box'`` (a 4‑tuple of x, y, w, h)
-        and ``'rpm'`` (a float).  The list is sorted in ascending
-        order of cluster ID.  If the heuristics reject all clusters the
-        list may be empty.
+    clusters : list of ClusterResult
+        Results sorted in ascending cluster ID order.  If all heuristics
+        reject the current window the list may be empty.
     """
     # Ensure arrays are NumPy arrays of correct dtype
     x = np.asarray(x_coords, dtype=np.int32)
@@ -482,7 +493,7 @@ def analyze_window(
         x = x[order]
         y = y[order]
     # Detect clusters and bounding boxes
-    labels, boxes, cluster_ids = detect_clusters(
+    labels, boxes, _ = detect_clusters(
         x,
         y,
         width,
@@ -490,8 +501,9 @@ def analyze_window(
         min_size=min_cluster_size,
         min_fill_ratio=min_fill_ratio,
         max_aspect_ratio=max_aspect_ratio,
-    )  # , min_events_per_pixel=MIN_EVENTS_PER_PIXEL)
-    clusters: List[Dict[str, object]] = []
+        min_events_per_pixel=min_events_per_pixel,
+    )
+    clusters: List[ClusterResult] = []
     for idx, box in enumerate(boxes, start=1):
         # Extract indices belonging to this cluster
         mask = labels == idx
@@ -500,5 +512,5 @@ def analyze_window(
             rpm = float("nan")
         else:
             rpm = estimate_rpm(cluster_ts, rpm_range=rpm_range, **rpm_kwargs)
-        clusters.append({"box": box, "rpm": rpm})
+        clusters.append(ClusterResult(box=box, rpm=rpm))
     return clusters

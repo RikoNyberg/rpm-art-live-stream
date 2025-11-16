@@ -22,11 +22,10 @@ rendering.
 
 from __future__ import annotations
 
-from statistics import mean
-from typing import Iterable, Tuple, List, Dict, Optional
-
-import time
 import itertools
+import time
+from statistics import mean
+from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -37,9 +36,11 @@ from evio.core.pacer import Pacer
 from evio.core.recording import open_dat
 from evio.source.dat_file import DatFileSource
 
-from rpm import decode_window, analyze_window
+from rpm import ClusterResult, analyze_window, decode_window
 
-BLADE_COUNT = 2
+
+WINDOW_NAME = "Event Viewer"
+
 
 def _get_frame(
     x_coords: np.ndarray,
@@ -80,11 +81,16 @@ def _draw_overlay(
     frame: np.ndarray,
     pacer: Pacer,
     batch_range: object,
-    clusters: List[Dict[str, object]],
+    clusters: Sequence[ClusterResult],
     blade_count: int,
     *,
     hud_color: Tuple[int, int, int] = (0, 0, 0),
-    box_colors: Iterable[Tuple[int, int, int]] = ((0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0)),
+    box_colors: Iterable[Tuple[int, int, int]] = (
+        (0, 255, 0),
+        (255, 0, 0),
+        (0, 0, 255),
+        (255, 255, 0),
+    ),
     text_color: Tuple[int, int, int] = (255, 0, 255),
     label_offset: int = 12,
 ) -> None:
@@ -100,11 +106,8 @@ def _draw_overlay(
     batch_range : BatchRange
         Represents the current window range; used to compute the
         recording time offset displayed in the HUD.
-    global_rpm : float
-        Estimated RPM over all events in the current window.
-    clusters : list of dicts
-        Each dict must have a ``'box'`` key with ``(x, y, w, h)`` and
-        an ``'rpm'`` key.  Boxes are drawn in the order provided.
+    clusters : Sequence[ClusterResult]
+        Per-cluster results defining bounding boxes and RPM values.
     hud_color : tuple, optional
         Color used for the HUD text.
     box_colors : iterable of tuple, optional
@@ -128,12 +131,11 @@ def _draw_overlay(
             first_row = (
                 f"(target) speed={pacer.speed:.2f}x  force_speed=False, no drops"
             )
-        rpm_values = []
-        for entry in clusters:
-            rpm_val = entry.get("rpm")
-            if rpm_val is None or np.isnan(rpm_val):
-                continue
-            rpm_values.append(rpm_val / blade_count)
+        rpm_values = [
+            cluster.rpm / blade_count
+            for cluster in clusters
+            if not np.isnan(cluster.rpm)
+        ]
         mean_rpm = mean(rpm_values) if rpm_values else float("nan")
         second_row = f"wall={wall_time_s:7.3f}s  rec={rec_time_s:7.3f}s  Mean RPM={mean_rpm:7.1f}"
         cv2.putText(frame, first_row, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1, cv2.LINE_AA)
@@ -141,29 +143,26 @@ def _draw_overlay(
     # Cycle through provided colors for clusters
     color_cycle = itertools.cycle(box_colors)
     for cluster, color in zip(clusters, color_cycle):
-        box = cluster.get("box")  # (x, y, w, h)
-        rpm = cluster.get("rpm")
-        if box is None:
-            continue
-        x, y, w, h = map(int, box)
+        x, y, w, h = map(int, cluster.box)
         # Draw rectangle
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
         # Draw RPM text above the box
-        rpm_text = f"{rpm:0.0f} RPM" if not np.isnan(rpm) else "? RPM"
+        rpm_text = f"{cluster.rpm:0.0f} RPM" if not np.isnan(cluster.rpm) else "? RPM"
         cv2.putText(frame, rpm_text, (x, max(0, y - label_offset)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1, cv2.LINE_AA)
 
 
 def visualize_dat(
     dat_path: str,
-    blade_count: int,
+    blade_count: int = 2,
     *,
-    window_ms: float = 100.0,
+    window_ms: float = 10.0,
     rpm_range: Tuple[int, int] = (1000, 7000),
     speed: float = 1.0,
     force_speed: bool = False,
     min_cluster_size: int = 50,
     min_fill_ratio: float = 0.15,
     max_aspect_ratio: Optional[float] = None,
+    min_events_per_pixel: Optional[int] = None,
     display: bool = True,
     **rpm_kwargs: object,
 ) -> None:
@@ -173,6 +172,9 @@ def visualize_dat(
     ----------
     dat_path : str
         Path to the ``.dat`` recording to play.
+    blade_count : int, optional
+        Number of blades or repeating features per revolution.  Used to
+        convert event RPM values to mechanical RPM.  Must be positive.
     window_ms : float, optional
         Length of the display window in milliseconds.  This controls
         how many events are grouped into each frame and implicitly
@@ -197,6 +199,9 @@ def visualize_dat(
     max_aspect_ratio : float, optional
         If provided, clusters whose width/height exceeds this ratio are
         dropped.  Use this to reject very thin streaks.
+    min_events_per_pixel : int, optional
+        Minimum number of hits required per pixel before it participates
+        in cluster formation.  Helps suppress sparse noise.
     display : bool, optional
         If ``True`` (default), opens an OpenCV window and renders
         annotated frames.  If ``False``, no GUI is created and the
@@ -215,6 +220,10 @@ def visualize_dat(
     across multiple frames outside of this function and passing them
     into ``analyze_window`` separately.
     """
+    if blade_count <= 0:
+        raise ValueError("blade_count must be positive")
+    if window_ms <= 0:
+        raise ValueError("window_ms must be positive")
     # Convert milliseconds to microseconds
     window_us = int(window_ms * 1000)
     # Load the recording once to get timestamps, width and height
@@ -228,7 +237,7 @@ def visualize_dat(
     
     # Setup display window you want to view the calculations
     if display:
-        cv2.namedWindow("Event Viewer", cv2.WINDOW_NORMAL)
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     
     # Iterate over windows
     for batch_range in pacer.pace(src.ranges()):
@@ -254,6 +263,7 @@ def visualize_dat(
             min_cluster_size=min_cluster_size,
             min_fill_ratio=min_fill_ratio,
             max_aspect_ratio=max_aspect_ratio,
+            min_events_per_pixel=min_events_per_pixel,
             **rpm_kwargs,
         )
         
@@ -263,7 +273,7 @@ def visualize_dat(
             # Draw overlay text and boxes
             _draw_overlay(frame, pacer, batch_range, clusters, blade_count)
             # Show frame
-            cv2.imshow("Event Viewer", frame)
+            cv2.imshow(WINDOW_NAME, frame)
             # Poll key; break on Esc or q
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
@@ -271,4 +281,4 @@ def visualize_dat(
         # If not displaying, still respect potential drop by pacer
     # Cleanup
     if display:
-        cv2.destroyAllWindows()
+        cv2.destroyWindow(WINDOW_NAME)
