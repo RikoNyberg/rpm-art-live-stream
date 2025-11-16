@@ -33,16 +33,15 @@ downloads the tracked data blobs into `data/`.
 
 ## Usage
 
-1. Place your `.dat` recordings in the `data/` directory or update the
-   paths in `main.py::configs`.
-2. Pick one of the predefined configurations (`fan_const_rpm`,
-   `drone_moving`, or `fred_events`) or add your own dictionary entry.
-3. Run the visualization loop:
+1. After `git lfs pull` your `.dat` recordings are in the `data/` directory.
+2. Run the visualization loop:
    ```bash
    python main.py
    ```
    The script decodes the stream with the selected window size, estimates
    blade RPM within the configured range, and renders interactive output.
+
+You can select between predefined configurations (`fan_const_rpm`, `drone_moving`, or `fred_events`) or set your own configurations and/or set your own data to `data/` folder
 
 You can tune `window_ms`, `blade_count`, `min_cluster_size`, and other
 parameters inside `main.py` to match new datasets or hardware.
